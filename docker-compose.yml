@@ -54,6 +54,16 @@ services:
     depends_on:
       - demo-app
 
+  analyzer:
+    build: ./backend
+    ports:
+      - "8001:8001"
+    environment:
+      - PROMETHEUS_URL=http://prometheus:9090
+    mem_limit: 256m
+    depends_on:
+      - prometheus
+
 volumes:
   prometheus_data:
   grafana_data:
