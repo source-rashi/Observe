@@ -3,6 +3,7 @@
 import asyncio
 import logging
 import pathlib
+import re
 from typing import Optional
 
 import asyncpg
@@ -40,12 +41,40 @@ async def create_pool(
     return None
 
 
+def _split_sql(sql: str):
+    """Split a SQL file into individual statements, skipping empty ones.
+
+    asyncpg's execute() rejects multi-statement strings that contain
+    SELECT-returning calls (e.g. create_hypertable, add_retention_policy).
+    We execute statements one by one instead.
+    """
+    # Strip single-line comments before splitting
+    sql_no_comments = re.sub(r'--[^\n]*', '', sql)
+    raw_stmts = sql_no_comments.split(';')
+    return [s.strip() for s in raw_stmts if s.strip()]
+
+
 async def ensure_schema(pool: asyncpg.Pool) -> None:
-    """Execute schema.sql idempotently against *pool*."""
+    """Execute schema.sql idempotently against *pool*, statement by statement."""
     sql = _SCHEMA_PATH.read_text(encoding="utf-8")
+    statements = _split_sql(sql)
     async with pool.acquire() as conn:
-        await conn.execute(sql)
-    logger.info("Schema ensured.")
+        for stmt in statements:
+            try:
+                await conn.execute(stmt)
+            except asyncpg.exceptions.DuplicateObjectError:
+                pass  # IF NOT EXISTS guard missed something — safe to ignore
+    logger.info("Schema ensured (%d statements).", len(statements))
+
+
+async def ping(pool: asyncpg.Pool) -> bool:
+    """Return True if the pool can execute a trivial query."""
+    try:
+        async with pool.acquire() as conn:
+            await conn.execute("SELECT 1")
+        return True
+    except Exception:
+        return False
 
 
 async def close_pool(pool: Optional[asyncpg.Pool]) -> None:

@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
-from app.database import close_pool, create_pool, ensure_schema
+from app.database import close_pool, create_pool, ensure_schema, ping
 from app.detector import zscore
 from app.incidents import IncidentManager
 from app.prometheus_client import PrometheusClient
@@ -24,26 +24,24 @@ client = PrometheusClient(settings.PROMETHEUS_URL)
 store = AnomalyStore(settings)
 incident_manager = IncidentManager(settings.INCIDENT_WINDOW_SECONDS)
 
-_pool = None  # set during lifespan
-_db_ok = False
+# Mutable state — updated during lifespan
+_state: Dict[str, Any] = {"pool": None, "db_available": False}
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool, _db_ok
-
     pool = await create_pool(settings.DATABASE_URL)
-    _pool = pool
-    _db_ok = pool is not None
+    _state["pool"] = pool
 
     if pool is not None:
         try:
             await ensure_schema(pool)
+            _state["db_available"] = True
         except Exception as e:
             logger.warning("Schema application failed: %s — running without persistence.", e)
-            _db_ok = False
+            # Keep pool open; individual queries will fail and be caught
 
-        if _db_ok:
+        if _state["db_available"]:
             try:
                 from app.repository import load_active_state
                 anomalies, incidents = await load_active_state(pool)
@@ -58,7 +56,11 @@ async def lifespan(app: FastAPI):
                 logger.warning("State restore failed: %s", e)
 
     task = asyncio.create_task(
-        detection_loop(client, store, settings, pool=_pool, incident_manager=incident_manager)
+        detection_loop(
+            client, store, settings,
+            pool=_state["pool"],
+            incident_manager=incident_manager,
+        )
     )
     yield
     task.cancel()
@@ -66,7 +68,7 @@ async def lifespan(app: FastAPI):
         await task
     except asyncio.CancelledError:
         pass
-    await close_pool(_pool)
+    await close_pool(_state["pool"])
 
 
 app = FastAPI(title="AI Observability Analyzer", lifespan=lifespan)
@@ -89,11 +91,20 @@ async def health():
     prom_up = await client.is_up()
     active_count = len(store.list("active"))
     open_incidents = len(incident_manager.list("open"))
+
+    # Live DB check — reflects real-time connectivity, not just startup status
+    pool = _state["pool"]
+    if pool is not None:
+        db_ok = await ping(pool)
+        _state["db_available"] = db_ok
+    else:
+        db_ok = False
+
     return {
         "status": "ok",
         "prometheus": prom_up,
         "active_anomalies": active_count,
-        "db": _db_ok,
+        "db": db_ok,
         "open_incidents": open_incidents,
     }
 
@@ -178,7 +189,9 @@ async def get_anomaly(anomaly_id: str):
 @app.post("/detect/run")
 async def trigger_detect_run():
     active = await run_detection_cycle(
-        client, store, settings, pool=_pool, incident_manager=incident_manager
+        client, store, settings,
+        pool=_state["pool"],
+        incident_manager=incident_manager,
     )
     return active
 
@@ -189,10 +202,11 @@ async def trigger_detect_run():
 
 @app.get("/incidents")
 async def get_incidents(status: str = Query("open", pattern="^(open|resolved|all)$")):
-    if _db_ok and _pool is not None:
+    pool = _state["pool"]
+    if pool is not None and _state.get("db_available"):
         try:
             from app.repository import list_incidents
-            return await list_incidents(_pool, status)
+            return await list_incidents(pool, status)
         except Exception as e:
             logger.warning("DB list_incidents failed, falling back to memory: %s", e)
     # In-memory fallback
@@ -214,10 +228,11 @@ async def get_incidents(status: str = Query("open", pattern="^(open|resolved|all
 
 @app.get("/incidents/{inc_id}")
 async def get_incident(inc_id: str):
-    if _db_ok and _pool is not None:
+    pool = _state["pool"]
+    if pool is not None and _state.get("db_available"):
         try:
             from app.repository import get_incident as repo_get_incident
-            result = await repo_get_incident(_pool, inc_id)
+            result = await repo_get_incident(pool, inc_id)
             if result is None:
                 raise HTTPException(status_code=404, detail="Incident not found")
             return result
@@ -263,7 +278,8 @@ async def history_signals(
     endpoint: str = Query("all"),
     minutes: int = Query(60, ge=1, le=1440),
 ):
-    if not _db_ok or _pool is None:
+    pool = _state["pool"]
+    if not _state.get("db_available") or pool is None:
         raise HTTPException(
             status_code=503,
             detail="Signal history requires the database (TimescaleDB is unavailable).",
@@ -272,7 +288,7 @@ async def history_signals(
     start = now - timedelta(minutes=minutes)
     try:
         from app.repository import get_samples
-        rows = await get_samples(_pool, signal, endpoint, start, now)
+        rows = await get_samples(pool, signal, endpoint, start, now)
     except Exception as e:
         logger.warning("get_samples failed: %s", e)
         raise HTTPException(status_code=503, detail=f"DB error: {e}")
