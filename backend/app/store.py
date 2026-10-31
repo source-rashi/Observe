@@ -22,16 +22,23 @@ class Anomaly:
     started_at: float
     last_seen_at: float
     resolved_at: Optional[float]
+    incident_id: Optional[str] = None
     points: List[Tuple[float, float]] = field(default_factory=list)
+
 
 class AnomalyStore:
     def __init__(self, cfg: Settings):
         self.cfg = cfg
         self._lock = threading.Lock()
-        self._anomalies: Dict[str, Anomaly] = {}  # id -> Anomaly
+        self._anomalies: Dict[str, Anomaly] = {}          # id -> Anomaly
         self._active_keys: Dict[Tuple[str, str], str] = {}  # (signal, endpoint) -> anomaly_id
         self._clear_counts: Dict[Tuple[str, str], int] = {}  # (signal, endpoint) -> consecutive clear count
         self._signal_units = {s.name: s.unit for s in SIGNALS}
+        self._events: List[Tuple[str, Anomaly]] = []      # (event_type, anomaly)
+
+    # ------------------------------------------------------------------
+    # Core mutation API (return values / signatures are unchanged)
+    # ------------------------------------------------------------------
 
     def update(self, detection: Detection) -> Anomaly:
         key = (detection.signal, detection.endpoint)
@@ -48,6 +55,7 @@ class AnomalyStore:
                 anomaly.points = detection.points
                 anomaly.baseline_mean = detection.baseline_mean
                 anomaly.baseline_std = detection.baseline_std
+                self._events.append(("updated", anomaly))
                 return anomaly
             else:
                 short_id = uuid.uuid4().hex[:8]
@@ -71,6 +79,7 @@ class AnomalyStore:
                 )
                 self._anomalies[short_id] = anomaly
                 self._active_keys[key] = short_id
+                self._events.append(("created", anomaly))
                 self._enforce_capacity()
                 return anomaly
 
@@ -88,8 +97,13 @@ class AnomalyStore:
                 if anomaly:
                     anomaly.status = "resolved"
                     anomaly.resolved_at = anomaly.last_seen_at
+                    self._events.append(("resolved", anomaly))
                 return anomaly
             return None
+
+    # ------------------------------------------------------------------
+    # Query helpers
+    # ------------------------------------------------------------------
 
     def list(self, status: str = "active") -> List[Anomaly]:
         with self._lock:
@@ -102,11 +116,44 @@ class AnomalyStore:
         with self._lock:
             return self._anomalies.get(anomaly_id)
 
+    # ------------------------------------------------------------------
+    # Event bus
+    # ------------------------------------------------------------------
+
+    def pop_events(self) -> List[Tuple[str, Anomaly]]:
+        """Return and clear pending lifecycle events.
+        Each tuple is (event_type, anomaly) where event_type is one of
+        'created', 'updated', 'resolved'.
+        """
+        with self._lock:
+            ev = list(self._events)
+            self._events.clear()
+            return ev
+
+    # ------------------------------------------------------------------
+    # Restart recovery
+    # ------------------------------------------------------------------
+
+    def restore(self, anomalies: List[Anomaly]) -> None:
+        """Load anomalies into the store without emitting events.
+        Used on startup to re-hydrate state from the database.
+        """
+        with self._lock:
+            for a in anomalies:
+                self._anomalies[a.id] = a
+                if a.status == "active":
+                    key = (a.signal, a.endpoint)
+                    self._active_keys[key] = a.id
+                    self._clear_counts[key] = 0
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
     def _enforce_capacity(self) -> None:
         if len(self._anomalies) <= self.cfg.MAX_ANOMALIES:
             return
 
-        # Sort: resolved first (by oldest resolved_at), then active by oldest started_at
         to_drop = len(self._anomalies) - self.cfg.MAX_ANOMALIES
         resolved = sorted(
             [a for a in self._anomalies.values() if a.status == "resolved"],
