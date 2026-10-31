@@ -14,5 +14,10 @@ class Settings:
     DETECTION_INTERVAL_SECONDS: int = int(os.getenv("DETECTION_INTERVAL_SECONDS", "15"))
     RESOLVE_AFTER_CYCLES: int = int(os.getenv("RESOLVE_AFTER_CYCLES", "3"))
     MAX_ANOMALIES: int = int(os.getenv("MAX_ANOMALIES", "200"))
+    DATABASE_URL: str = os.getenv(
+        "DATABASE_URL",
+        "postgresql://observe:observe@timescaledb:5432/observe",
+    )
+    INCIDENT_WINDOW_SECONDS: int = int(os.getenv("INCIDENT_WINDOW_SECONDS", "120"))
 
 settings = Settings()
