@@ -54,16 +54,38 @@ services:
     depends_on:
       - demo-app
 
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-observe}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-observe}
+      POSTGRES_DB: ${POSTGRES_DB:-observe}
+    volumes:
+      - timescale_data:/var/lib/postgresql/data
+    ports:
+      - "127.0.0.1:5432:5432"
+    mem_limit: 512m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-observe} -d ${POSTGRES_DB:-observe}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
   analyzer:
     build: ./backend
     ports:
       - "8001:8001"
     environment:
       - PROMETHEUS_URL=http://prometheus:9090
+      - DATABASE_URL=postgresql://${POSTGRES_USER:-observe}:${POSTGRES_PASSWORD:-observe}@timescaledb:5432/${POSTGRES_DB:-observe}
     mem_limit: 256m
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
+      timescaledb:
+        condition: service_healthy
 
 volumes:
   prometheus_data:
   grafana_data:
+  timescale_data:
