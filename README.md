@@ -2,7 +2,7 @@
 
 End-to-end observability and root-cause analysis stack for AI systems.
 
-Status: Phase 3 (analyzer + anomaly detection)
+**Status: Phase 4 (persistence + incidents)**
 
 ## Demo App
 
@@ -31,11 +31,30 @@ A FastAPI application instrumented with OpenTelemetry metrics and failure inject
 ## Analyzer API
 
 The analyzer service operates on port 8001:
-- `GET /health`: Service health status, Prometheus readiness, and active anomaly count
+- `GET /health`: Service health status, Prometheus readiness, active anomaly count, DB status, open incident count
 - `GET /signals`: Inspection endpoint showing current baseline mean, std, latest value, and z-score for each signal/endpoint
-- `GET /anomalies?status=active|resolved|all`: Filter anomalies by status (defaults to active)
+- `GET /anomalies?status=active|resolved|all`: Filter anomalies by status (defaults to active); each anomaly includes `incident_id`
 - `GET /anomalies/{id}`: Retrieve a specific anomaly by short ID (404 if unknown)
 - `POST /detect/run`: Manually trigger one detection cycle immediately and return active anomalies
+
+### New Endpoints (Phase 4)
+- `GET /incidents?status=open|resolved|all`: List incidents (default: open); reads from DB when available, falls back to memory
+- `GET /incidents/{id}`: Incident detail with its anomalies (404 if unknown)
+- `GET /history/signals?signal=<name>&endpoint=<name|all>&minutes=60`: Raw signal samples from TimescaleDB (minutes clamped 1–1440); returns 503 when DB is unavailable
+
+## Data Model
+
+Three tables are stored in TimescaleDB:
+
+| Table | Description |
+|---|---|
+| `signal_samples` | Raw metric data points (hypertable; 7-day retention) |
+| `incidents` | Grouped anomaly incidents with status and severity |
+| `anomalies` | Individual anomaly records linked to incidents via `incident_id` |
+
+## Incident Grouping
+
+A new anomaly joins an **open** incident whose `started_at` is within `INCIDENT_WINDOW_SECONDS` (default 120 s) of the anomaly's `started_at`. If no matching incident exists, a new one is created. Severity is the highest among member anomalies (`critical` > `warning`). A resolved incident is **never** reused. An incident becomes `resolved` when **all** its member anomalies are resolved.
 
 ## How Detection Works
 
@@ -49,3 +68,4 @@ The analyzer service operates on port 8001:
 
 - **Baseline Contamination**: A sustained, long-running incident will gradually incorporate into the rolling 15-minute window and become the new baseline.
 - **Stationarity Assumption**: Z-score detection assumes roughly stable normal behavior and can generate false positives during legitimate step-function traffic changes.
+- **Schema migrations**: The schema is applied idempotently at startup via `schema.sql`; there is no migration tool yet.
